@@ -11,12 +11,15 @@ before it trusts any data.
 import base64
 import math
 import struct
+import threading
 import time
 
 from . import PROTOCOL, __version__
 from .reader import GAME_VERSION, SUPPORTED, WORLD_SCENE, LiveError, LiveReader
 
 NO_SAVE = 'No save loaded'   # the official socket's text for the title screen and while a save loads
+FLAG_PAGE = 1000      # entries per x-flags-since page: about 11 KB of reply
+FLAG_STALE = 0.2      # x-flags-since reads the game again when its copy is older than this (seconds)
 
 
 def yaw_from_rotation(rot):
@@ -49,8 +52,76 @@ COMMANDS = [
     ('x-scene', '', "scene: 'MainField' (the open world) or the shrine Link is in ('Dungeon062'); shrine: true in one"),
     ('x-flags', '', 'the GameData flags and the set GUIDs, as in progress.sav: flags = base64 of <II (hash, value) '
                     'pairs, guids = base64 of <Q'),
+    ('x-flags-since', '<since> [cursor]',
+     'the GameData flags and GUIDs changed after scan since (0: all), a page at a time: flags = base64 of <II '
+     '(hash, value), guids_on / guids_off = base64 of <Q; seq, base, reset, more, cursor, count'),
     ('x-inventory', '', 'armor: the armor actors carried; materials: {actor: count}'),
 ]
+ARGS = {name: args for name, args, _ in COMMANDS}
+
+
+class FlagLog:
+    """The flags and GUIDs with the scan that last changed each: what x-flags-since pages through.
+
+    Each scan is numbered (seq). A client asks for what changed after the scan it last saw; base is the first scan
+    of the current layout (the bridge started, or a flag appeared or went away): since < base gets a reset, the whole
+    state. The order of the entries holds within a layout (flags by hash, then GUIDs in the order first seen), so a
+    cursor stays valid between pages. Not thread-safe: the Bridge locks."""
+
+    def __init__(self, start=None):
+        # seq starts at the time in ms: scans are FLAG_STALE apart, so a restarted bridge starts above any seq the
+        # one before gave, and a client still holding one gets a reset
+        self.seq = self.base = int(time.time() * 1000) if start is None else start
+        self.hashes = []      # the flags, by hash
+        self.flags = {}       # hash: [value, stamp]
+        self.guids = {}       # guid: [on, stamp], in the order first seen
+        self.order = []
+
+    def update(self, flags, guids):
+        self.seq += 1
+        if sorted(flags) != self.hashes:   # a new layout: everything is new
+            self.base = self.seq
+            self.hashes = sorted(flags)
+            self.flags = {h: [flags[h], self.seq] for h in self.hashes}
+            self.order = list(guids)
+            self.guids = {g: [True, self.seq] for g in self.order}
+            return
+        for h, v in flags.items():
+            e = self.flags[h]
+            if e[0] != v:
+                e[0], e[1] = v, self.seq
+        for g, e in self.guids.items():
+            on = g in guids
+            if e[0] != on:
+                e[0], e[1] = on, self.seq
+        for g in guids:
+            if g not in self.guids:
+                self.guids[g] = [True, self.seq]
+                self.order.append(g)
+
+    def page(self, since, cursor, size=FLAG_PAGE):
+        reset = since < self.base or since > self.seq
+        after = 0 if reset else since
+        nflags, total = len(self.hashes), len(self.hashes) + len(self.order)
+        flags, on, off = [], [], []
+        i = cursor
+        while i < total and len(flags) + len(on) + len(off) < size:
+            if i < nflags:
+                h = self.hashes[i]
+                v, stamp = self.flags[h]
+                if stamp > after:
+                    flags.append((h, v))
+            else:
+                g = self.order[i - nflags]
+                is_on, stamp = self.guids[g]
+                if stamp > after and (is_on or not reset):   # a reset sends only the set GUIDs
+                    (on if is_on else off).append(g)
+            i += 1
+        b64 = lambda fmt, items: base64.b64encode(b''.join(struct.pack(fmt, *x) for x in items)).decode('ascii')
+        return {'seq': self.seq, 'base': self.base, 'reset': reset, 'more': i < total, 'cursor': i,
+                'count': len(flags), 'flags': b64('<II', flags), 'guids_on': b64('<Q', ((g,) for g in on)),
+                'guids_off': b64('<Q', ((g,) for g in off))}
+
 
 
 def ok(data):
@@ -67,6 +138,9 @@ class Bridge:
     def __init__(self, reader=None):
         self.reader = reader or LiveReader()
         self.started = time.monotonic()
+        self.log = FlagLog()
+        self.log_lock = threading.Lock()
+        self.scanned = None   # time.monotonic() of the log's last scan
 
     def info(self):
         st = self.reader.status()
@@ -79,10 +153,13 @@ class Bridge:
             return err('empty request')
         cmd = parts[0].lower()
         fn = getattr(self, 'cmd_' + cmd.replace('-', '_'), None)
-        if fn is None or cmd not in {c[0] for c in COMMANDS}:
+        if fn is None or cmd not in ARGS:
             return err(f'unknown command: {cmd}')
+        args = parts[1:]
+        if args and not ARGS[cmd]:   # as the official socket: a command without args takes none
+            return err(f'Usage: {cmd}')
         try:
-            return ok(fn())
+            return ok(fn(*args) if ARGS[cmd] else fn())
         except LiveError as e:
             return err(str(e))
 
@@ -137,6 +214,19 @@ class Bridge:
         packed = b''.join(struct.pack('<II', h, v) for h, v in sorted(flags.items()))
         return {'count': len(flags), 'flags': base64.b64encode(packed).decode('ascii'),
                 'guid_count': len(guids), 'guids': base64.b64encode(struct.pack(f'<{len(guids)}Q', *sorted(guids))).decode('ascii')}
+
+    def cmd_x_flags_since(self, *args):
+        usage = LiveError('Usage: x-flags-since <since> [cursor]')
+        if not 1 <= len(args) <= 2 or not all(a.isdigit() for a in args):
+            raise usage
+        since, cursor = int(args[0]), int(args[1]) if len(args) > 1 else 0
+        with self.log_lock:
+            now = time.monotonic()
+            if self.scanned is None or now - self.scanned >= FLAG_STALE:
+                flags, guids = self.reader.snapshot()   # LiveError: the log keeps what it had
+                self.log.update(flags, guids)
+                self.scanned = now
+            return self.log.page(since, cursor)
 
     def cmd_x_inventory(self):
         armor, mats = self.reader.inventory()

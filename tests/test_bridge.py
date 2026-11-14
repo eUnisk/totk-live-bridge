@@ -1,4 +1,5 @@
 """python -m unittest discover -s tests (from the repository root). No game needed: a fake reader stands in."""
+import base64
 import io
 import json
 import math
@@ -150,6 +151,113 @@ def make_pe(symbols, buildid=b'\x01' * 0x35):
         struct.pack_into('<8sIIII', head, pe + 24 + optsz + 40 * i, name, vsize, va, 0x200 if name == b'.buildid' else 0, raw)
     body = (buildid or b'').ljust(0x200, b'\0')
     return bytes(head) + body + table + struct.pack('<I', 4 + len(strings)) + strings, fh
+
+
+class ChangingReader(FakeReader):
+    """A reader whose flags and set GUIDs the test changes between scans."""
+
+    def __init__(self, flags, guids):
+        super().__init__()
+        self.flags, self.guids = dict(flags), set(guids)
+
+    def snapshot(self):
+        self._check()
+        return dict(self.flags), set(self.guids)
+
+
+def pull(bridge, since):
+    """What a client does: pages with the same since until more is false. (next since, base, reset, flags, on, off)"""
+    cursor, first, flags, on, off = 0, None, {}, [], []
+    while True:
+        d = bridge.handle(f'x-flags-since {since} {cursor}')['data']
+        if first is None:
+            first = d
+        assert d['base'] == first['base']
+        flags.update(struct.iter_unpack('<II', base64.b64decode(d['flags'])))
+        on += [g for (g,) in struct.iter_unpack('<Q', base64.b64decode(d['guids_on']))]
+        off += [g for (g,) in struct.iter_unpack('<Q', base64.b64decode(d['guids_off']))]
+        if not d['more']:
+            return first['seq'], first['base'], first['reset'], flags, on, off
+        cursor = d['cursor']
+
+
+class FlagsSinceTest(unittest.TestCase):
+    def setUp(self):
+        # 1500 flags: two pages; the GUIDs come after the flags, on the second page
+        self.r = ChangingReader({h: h % 7 for h in range(1500)}, {11, 22})
+        self.b = Bridge(self.r)
+        self.b.log.seq = self.b.log.base = 5000   # as a bridge started at 5000 ms
+
+    def scan(self):
+        self.b.scanned = None   # the next request reads the game again
+
+    def test_full_then_changes(self):
+        seq, base, reset, flags, on, off = pull(self.b, 0)
+        self.assertTrue(reset)
+        self.assertEqual(flags, self.r.flags)
+        self.assertEqual(sorted(on), [11, 22])
+        self.assertEqual(off, [])
+        self.assertEqual(base, 5001)
+
+        self.r.flags[1234] = 99
+        self.r.guids = {22, 33}
+        self.scan()
+        seq2, base2, reset, flags, on, off = pull(self.b, seq)
+        self.assertFalse(reset)
+        self.assertEqual((flags, on, off), ({1234: 99}, [33], [11]))
+        self.assertEqual(base2, base)
+        self.assertGreater(seq2, seq)
+
+        self.scan()
+        _, _, reset, flags, on, off = pull(self.b, seq2)
+        self.assertEqual((reset, flags, on, off), (False, {}, [], []))
+
+    def test_reset_sends_only_set_guids(self):
+        seq, *_ = pull(self.b, 0)
+        self.r.guids = {22}
+        self.scan()
+        pull(self.b, seq)
+        _, _, reset, _, on, off = pull(self.b, 0)
+        self.assertTrue(reset)
+        self.assertEqual((on, off), ([22], []))   # 11 is known but unset: not in a reset
+
+    def test_new_layout_resets(self):
+        seq, base, *_ = pull(self.b, 0)
+        self.r.flags[99999] = 1   # a flag appeared: the copy starts over
+        self.scan()
+        _, base2, reset, flags, _, _ = pull(self.b, seq)
+        self.assertTrue(reset)
+        self.assertGreater(base2, base)
+        self.assertEqual(flags, self.r.flags)
+
+    def test_since_from_another_run_resets(self):
+        self.assertTrue(pull(self.b, 10 ** 15)[2])   # a since this bridge never gave
+
+    def test_seq_starts_at_the_time(self):
+        self.assertGreater(Bridge(FakeReader()).handle('x-flags-since 0')['data']['seq'], 1_000_000_000_000)
+
+    def test_scans_at_most_every_stale(self):
+        seq, *_ = pull(self.b, 0)
+        self.r.flags[3] = 42
+        d = self.b.handle(f'x-flags-since {seq}')['data']   # the copy is fresh: the change isn't seen yet
+        self.assertEqual((d['seq'], d['count']), (seq, 0))
+
+    def test_error_keeps_the_copy(self):
+        seq, *_ = pull(self.b, 0)
+        self.r.fail = LiveError('No save loaded')
+        self.scan()
+        self.assertEqual(self.b.handle(f'x-flags-since {seq}'), {'ok': False, 'error': 'No save loaded'})
+        self.r.fail = None
+        _, _, reset, flags, _, _ = pull(self.b, seq)
+        self.assertEqual((reset, flags), (False, {}))
+
+    def test_usage(self):
+        usage = {'ok': False, 'error': 'Usage: x-flags-since <since> [cursor]'}
+        for line in ('x-flags-since', 'x-flags-since -1', 'x-flags-since a', 'x-flags-since 1 2 3'):
+            self.assertEqual(self.b.handle(line), usage, line)
+        self.assertEqual(self.b.handle('pos now'), {'ok': False, 'error': 'Usage: pos'})
+        args = {c['name']: c['args'] for c in self.b.handle('help')['data']['commands']}
+        self.assertEqual((args['x-flags-since'], args['pos']), ('<since> [cursor]', ''))
 
 
 class PeSymbolTest(unittest.TestCase):

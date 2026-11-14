@@ -45,7 +45,15 @@ Port 7778 by default, next to the official 7777, so both can run.
 | `state` | `game`, `uptime_s`, `world_s`, `in_world` (the official fields the bridge can know). `world_s`: game time since the save loaded, left out before; TotK Recomp's own clock, read from the `totk.exe` it runs (its symbol table names it), so it also follows the recomp build |
 | `x-scene` | `scene`: `MainField` (sky, surface and Depths) or the shrine, e.g. `Dungeon062`; `shrine`: true in one |
 | `x-flags` | the GameData flags and the set GUIDs, as in `progress.sav`: `flags` = base64 of little-endian `u32 hash, u32 value` pairs, `guids` = base64 of `u64`s, with `count` and `guid_count` |
+| `x-flags-since <since> [cursor]` | what changed in `x-flags` after scan `since`, a page (1000 entries) at a time: `flags` (as in `x-flags`), `guids_on`, `guids_off` (base64 of `u64`s), with `seq`, `base`, `reset`, `more`, `cursor`, `count`. The game is read again when the copy is over 0.2 s old |
 | `x-inventory` | `armor`: the armor actors carried; `materials`: `{actor: count}` |
+
+`x-flags-since` saves reading 325 KB a second: a client asks with `since` 0 and the `cursor` of each reply until
+`more` is false (the same `since` on every page), applies the pages, and asks next time with the first page's `seq`.
+`reset` true (on every page of that answer) means the whole state follows: drop what you had on the page with
+`cursor` 0. Should `base` differ between pages, start over from `since` 0. `seq` counts from the time in ms, so a
+`since` kept from before the bridge restarted gets a reset. A command without `args` takes none (`Usage: pos`), as
+on the official socket.
 
 The official socket has no `bridge` in its `help`: that is how a client tells the two apart. A client should check
 `bridge.protocol` (bumped when a reply changes in a way an existing client can't read) and `bridge.build_ok`
