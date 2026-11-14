@@ -12,8 +12,11 @@ the progress flags, the inventory and the shrine Link is in.
 find it suspicious. An app written against the protocol uses the official socket for whatever it answers and this
 bridge only for the rest, so it keeps working as the official socket grows.
 
-Supported: **TotK 1.4.3 in TotK Recomp 0.4.0**, on Windows. With any other build the bridge reads nothing: it checks
-the game's data tables first, and every data command answers `ok: false` with the supported build named.
+Supported: **TotK 1.4.3**, on **Windows** (tested in TotK Recomp 0.4.0). The addresses it reads are the game's own,
+so they follow the game version; a newer TotK Recomp that loads the game the same way keeps them. Either way the bridge
+checks the game's data tables first: with any other build it reads nothing, and every data command answers
+`ok: false` with the supported build named. (Linux, where TotK Recomp also runs, would need a `/proc/<pid>/mem`
+reader; not done yet.)
 
 ## Use
 
@@ -73,4 +76,5 @@ MIT. Not affiliated with Nintendo or with TotK Recomp.
 官方接口暂时没有的数据：进度 flag、背包、所在神庙。
 
 这是过渡方案：游戏或 recomp 一更新，内存地址就可能失效。bridge 启动后先校验游戏数据表，版本不符时不读任何数据，
-所有数据命令都返回 `ok: false` 并注明支持的版本（目前是 TotK 1.4.3 / TotK Recomp 0.4.0）。
+所有数据命令都返回 `ok: false` 并注明支持的版本。目前支持 Windows 上的 TotK 1.4.3（在 TotK Recomp 0.4.0 上测试）：
+读取的地址属于游戏本身，跟随游戏版本；recomp 升级后只要游戏的载入方式不变就仍然可用，校验会自动判断。

@@ -51,6 +51,7 @@ class BridgeServer:
             except OSError:
                 break
             conn.settimeout(None)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # one short reply per line: send at once
             if not self.slots.acquire(blocking=False):
                 conn.close()
                 continue

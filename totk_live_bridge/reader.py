@@ -82,8 +82,10 @@ PLAYER_CHAINS = [
 # whether he is in it. Inside a shrine his position is in that shrine's own coordinates, not the world map's.
 SCENE_OBJ, SCENE_CUR, SCENE_WORLD, SCENE_SHRINE, SCENE_STR = 0x3a4fc48, 0x108, 0x110, 0x128, 0x140
 WORLD_SCENE = 'MainField'   # what scene() calls the open world (sky, surface and Depths)
-GAME_VERSION, RECOMP_VERSION = '1.4.3', '0.4.0'   # the build the addresses above were found in
-SUPPORTED = f'TotK {GAME_VERSION} / TotK Recomp {RECOMP_VERSION}'
+# The addresses are the game's own (its code and data at fixed guest addresses), so they follow the game version;
+# a newer TotK Recomp that loads the game the same way keeps them. The vtable check decides either way.
+GAME_VERSION, RECOMP_VERSION = '1.4.3', '0.4.0'   # the game they were found for, and the recomp it was tested in
+SUPPORTED = f'TotK {GAME_VERSION} (tested in TotK Recomp {RECOMP_VERSION})'
 
 
 class LiveError(Exception):
