@@ -42,7 +42,7 @@ Port 7778 by default, next to the official 7777, so both can run.
 |---|---|
 | `help` | `commands` (`name`, `args`, `help`), and `bridge`: `name`, `version`, `protocol`, `supported`, `available`, `build_ok` (true / false / null: can't tell yet), `error` |
 | `pos` | `x`, `y`, `z`, `yaw`, `heading`, `place`, as the official `pos`; `No save loaded` on the title screen. Inside a shrine: the shrine's own coordinates (see `x-scene`) |
-| `state` | `game`, `in_world`, `uptime_s` (the official fields the bridge can know) |
+| `state` | `game`, `uptime_s`, `world_s`, `in_world` (the official fields the bridge can know). `world_s`: game time since the save loaded, left out before; TotK Recomp's own clock, read from the `totk.exe` it runs (its symbol table names it), so it also follows the recomp build |
 | `x-scene` | `scene`: `MainField` (sky, surface and Depths) or the shrine, e.g. `Dungeon062`; `shrine`: true in one |
 | `x-flags` | the GameData flags and the set GUIDs, as in `progress.sav`: `flags` = base64 of little-endian `u32 hash, u32 value` pairs, `guids` = base64 of `u64`s, with `count` and `guid_count` |
 | `x-inventory` | `armor`: the armor actors carried; `materials`: `{actor: count}` |

@@ -1,6 +1,8 @@
 """python -m unittest discover -s tests (from the repository root). No game needed: a fake reader stands in."""
+import io
 import json
 import math
+import struct
 import socket
 import sys
 import time
@@ -11,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from totk_live_bridge import PROTOCOL, __version__  # noqa: E402
 from totk_live_bridge.protocol import Bridge, decode_flags  # noqa: E402
-from totk_live_bridge.reader import LiveError, UnsupportedBuild  # noqa: E402
+from totk_live_bridge.reader import LiveError, UnsupportedBuild, pe_static  # noqa: E402
 from totk_live_bridge.server import MAX_CONNECTIONS, MAX_LINE, BridgeServer  # noqa: E402
 
 
@@ -21,8 +23,9 @@ def turn(deg):
 
 
 class FakeReader:
-    def __init__(self, pos=(843.4, 119.1, 849.6), rot=turn(-136.3), scene='MainField', fail=None):
-        self.pos, self.rot, self._scene, self.fail = pos, rot, scene, fail
+    def __init__(self, pos=(843.4, 119.1, 849.6), rot=turn(-136.3), scene='MainField', fail=None,
+                 world=3815578793):
+        self.pos, self.rot, self._scene, self.fail, self.world = pos, rot, scene, fail, world
 
     def _check(self):
         if self.fail:
@@ -39,6 +42,12 @@ class FakeReader:
     def snapshot(self):
         self._check()
         return {0xE573F564: 12601, 7: 1}, {3, 0xFFFFFFFFFFFFFFFF}
+
+    def world_us(self):
+        self._check()
+        if isinstance(self.world, Exception):
+            raise self.world
+        return self.world
 
     def inventory(self):
         self._check()
@@ -76,6 +85,16 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual((d['bridge']['protocol'], d['bridge']['version'], d['bridge']['build_ok']),
                          (PROTOCOL, __version__, True))
 
+    def test_state_world_clock(self):
+        d = Bridge(FakeReader()).handle('state')['data']
+        self.assertEqual(list(d), ['game', 'uptime_s', 'world_s', 'in_world'])   # the official order
+        self.assertEqual((d['game'], d['world_s'], d['in_world']), ('1.4.3', 3815.6, True))
+        # before the first save has loaded (and when the clock can't be read) world_s is left out, as officially
+        for world in (None, LiveError('cannot read 0x8 bytes')):
+            d = Bridge(FakeReader(pos=(0.0, 0.0, 0.0), world=world)).handle('state')['data']
+            self.assertNotIn('world_s', d)
+            self.assertFalse(d['in_world'])
+
     def test_flags_round_trip(self):
         d = Bridge(FakeReader()).handle('x-flags')['data']
         self.assertEqual(decode_flags(d), ({0xE573F564: 12601, 7: 1}, {3, 0xFFFFFFFFFFFFFFFF}))
@@ -102,6 +121,53 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(b.handle('teleport'), {'ok': False, 'error': 'unknown command: teleport'})
         self.assertEqual(b.handle('__init__')['ok'], False)
         self.assertEqual(b.handle('')['ok'], False)
+
+
+def make_pe(symbols, buildid=b'\x01' * 0x35):
+    """A PE file with the sections .text, .data, .bss (and .buildid) and a COFF symbol table of
+    (name, section number, value, storage class) records, each followed by one aux record of zeros."""
+    sections = [(b'.text', 0x1000, 0x100), (b'.data', 0x2000, 0x100), (b'.bss', 0x3000, 0x100)]
+    if buildid is not None:
+        sections.append((b'.buildid', 0x4000, len(buildid)))
+    pe, optsz = 0x80, 0xf0
+    raw = 0x400   # all section data starts here (only .buildid's is read)
+    strings = b''
+    table = b''
+    for name, sec, value, cls in symbols:
+        if len(name) <= 8:
+            field = name.ljust(8, b'\0')
+        else:
+            field = struct.pack('<II', 0, 4 + len(strings))
+            strings += name + b'\0'
+        table += field + struct.pack('<IhHBB', value, sec, 0, cls, 1) + bytes(18)
+    symptr = raw + 0x200
+    fh = struct.pack('<HHIIIHH', 0x8664, len(sections), 0x12345678, symptr, 2 * len(symbols), optsz, 0x22)
+    head = bytearray(raw)
+    head[:2] = b'MZ'
+    struct.pack_into('<I', head, 0x3c, pe)
+    head[pe:pe + 24] = b'PE\0\0' + fh
+    for i, (name, va, vsize) in enumerate(sections):
+        struct.pack_into('<8sIIII', head, pe + 24 + optsz + 40 * i, name, vsize, va, 0x200 if name == b'.buildid' else 0, raw)
+    body = (buildid or b'').ljust(0x200, b'\0')
+    return bytes(head) + body + table + struct.pack('<I', 4 + len(strings)) + strings, fh
+
+
+class PeSymbolTest(unittest.TestCase):
+    def test_short_name(self):
+        data, fh = make_pe([(b'main', 1, 0x10, 2), (b'world_us', 2, 0x50, 3)])
+        self.assertEqual(pe_static(io.BytesIO(data), b'world_us'), (0x2050, fh, (0x4000, b'\x01' * 0x35)))
+
+    def test_long_name(self):
+        data, _ = make_pe([(b'frame_step_world_us', 1, 0x40, 2), (b'some_long_clock_name', 3, 0x8, 3)], buildid=None)
+        self.assertEqual(pe_static(io.BytesIO(data), b'some_long_clock_name')[::2], (0x3008, None))
+        self.assertIsNone(pe_static(io.BytesIO(data), b'frame_step'))   # only whole names
+
+    def test_not_a_variable(self):
+        data, _ = make_pe([(b'world_us', 1, 0x50, 2)])   # in .text: a function, not the clock
+        self.assertIsNone(pe_static(io.BytesIO(data), b'world_us'))
+        data, _ = make_pe([(b'world_us', 2, 0x100, 3)])  # past the end of .data
+        self.assertIsNone(pe_static(io.BytesIO(data), b'world_us'))
+        self.assertIsNone(pe_static(io.BytesIO(b'not a PE file'), b'world_us'))
 
 
 class SocketTest(unittest.TestCase):

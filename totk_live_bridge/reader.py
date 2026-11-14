@@ -33,6 +33,14 @@ GameData (the flags the game writes to progress.sav):
 
 Link: a Vec3f world position followed by a 3x3 rotation, reached from several static pointers. They all
 agree; the reader takes the position most of them give and the rotation from one that has it.
+
+The world clock (state's world_s) is TotK Recomp's own, not the game's: `world_us` (s64, microseconds; -1 until the
+first save has loaded) in totk.exe's .data, the sum of the frame steps since the first present that found Link away
+from the origin. A later load (fast travel, another save, the title screen) doesn't restart it; the official socket
+answers it as world_s. totk.exe is an ordinary relocated image, so its address follows the recomp build: the reader
+finds it by name in the COFF symbol table of the totk.exe file the game runs from (TotK Recomp 0.4.0 ships one),
+after checking that the file's header and build id match the image in memory. A build without the symbol (or a
+changed file) only leaves world_s out.
 """
 import ctypes
 import math
@@ -84,6 +92,8 @@ SCENE_OBJ, SCENE_CUR, SCENE_WORLD, SCENE_SHRINE, SCENE_STR = 0x3a4fc48, 0x108, 0
 WORLD_SCENE = 'MainField'   # what scene() calls the open world (sky, surface and Depths)
 # The addresses are the game's own (its code and data at fixed guest addresses), so they follow the game version;
 # a newer TotK Recomp that loads the game the same way keeps them. The vtable check decides either way.
+WORLD_CLOCK = b'world_us'    # TotK Recomp's world clock, a static s64 in totk.exe's .data (see above)
+MAX_WORLD_US = 10 * 365 * 86400 * 10**6     # anything above is not a clock
 GAME_VERSION, RECOMP_VERSION = '1.4.3', '0.4.0'   # the game they were found for, and the recomp it was tested in
 SUPPORTED = f'TotK {GAME_VERSION} (tested in TotK Recomp {RECOMP_VERSION})'
 
@@ -94,6 +104,59 @@ class LiveError(Exception):
 
 class UnsupportedBuild(LiveError):
     """The game runs, but it is not the build these addresses were found in."""
+
+
+def pe_static(f, name):
+    """Where the static variable `name` (bytes) of a PE file is, from its COFF symbol table:
+    (rva, file header, build id) or None when the file has no such symbol in a data section. file header: the 20
+    bytes after 'PE\\0\\0', which the loader leaves as they are; build id: (rva, bytes) of the .buildid section, None
+    without one. Together they tell whether the file is the image running."""
+    head = f.read(0x1000)
+    if head[:2] != b'MZ':
+        return None
+    pe = struct.unpack_from('<I', head, 0x3c)[0]
+    if head[pe:pe + 4] != b'PE\0\0':
+        return None
+    fh = head[pe + 4:pe + 24]
+    nsec, _, symptr, nsyms, optsz = struct.unpack_from('<HIIIH', fh, 2)
+    sections = []
+    for i in range(nsec):
+        o = pe + 24 + optsz + 40 * i
+        if o + 40 > len(head):
+            return None
+        sname = head[o:o + 8].rstrip(b'\0')
+        vsize, va, rsize, raw = struct.unpack_from('<IIII', head, o + 8)
+        sections.append((sname, va, vsize, raw, rsize))
+    if not symptr or not 0 < nsyms < 10**7:
+        return None
+    f.seek(symptr)
+    table = f.read(18 * nsyms + 4)
+    if len(table) != 18 * nsyms + 4:
+        return None
+    strsize = struct.unpack_from('<I', table, 18 * nsyms)[0]
+    if len(name) <= 8:
+        keys = [name.ljust(8, b'\0')]
+    else:   # a long name is {0, offset into the string table (which counts its own 4-byte size)}
+        strings = b'\0' + f.read(max(0, strsize - 4))
+        keys, at = [], strings.find(b'\0' + name + b'\0')
+        while at >= 0:
+            keys.append(struct.pack('<II', 0, at + 4))
+            at = strings.find(b'\0' + name + b'\0', at + 1)
+    for key in keys:
+        at = table.find(key)
+        while 0 <= at < 18 * nsyms:
+            if at % 18 == 0:
+                value, sec, _, cls = struct.unpack_from('<IhHB', table, at + 8)
+                if cls in (2, 3) and 0 < sec <= nsec and sections[sec - 1][0] in (b'.data', b'.bss'):
+                    if value + 8 <= sections[sec - 1][2]:
+                        buildid = None
+                        for sname, va, vsize, raw, rsize in sections:
+                            if sname == b'.buildid' and 0 < vsize <= min(rsize, 256):
+                                f.seek(raw)
+                                buildid = (va, f.read(vsize))
+                        return sections[sec - 1][1] + value, fh, buildid
+            at = table.find(key, at + 1)
+    return None
 
 
 if WINDOWS:
@@ -118,8 +181,33 @@ if WINDOWS:
                     ('th32ParentProcessID', wt.DWORD), ('pcPriClassBase', ctypes.c_long), ('dwFlags', wt.DWORD),
                     ('szExeFile', ctypes.c_wchar * 260)]
 
+    class _MODULEENTRY32W(ctypes.Structure):
+        _fields_ = [('dwSize', wt.DWORD), ('th32ModuleID', wt.DWORD), ('th32ProcessID', wt.DWORD),
+                    ('GlblcntUsage', wt.DWORD), ('ProccntUsage', wt.DWORD), ('modBaseAddr', ctypes.c_void_p),
+                    ('modBaseSize', wt.DWORD), ('hModule', wt.HMODULE), ('szModule', ctypes.c_wchar * 256),
+                    ('szExePath', ctypes.c_wchar * 260)]
+
+    TH32CS_SNAPMODULE = 0x8
     _k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
     _k32.Process32FirstW.argtypes = _k32.Process32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _k32.Module32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(_MODULEENTRY32W)]
+
+    def main_module(pid):
+        """(load address, path) of the process's exe, or None. Needs no process handle."""
+        for _ in range(3):   # the snapshot can fail while the process loads a module (ERROR_BAD_LENGTH)
+            snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)
+            if snap and snap != wt.HANDLE(-1).value:
+                break
+        else:
+            return None
+        try:
+            e = _MODULEENTRY32W()
+            e.dwSize = ctypes.sizeof(e)
+            if not _k32.Module32FirstW(snap, ctypes.byref(e)) or not e.modBaseAddr:
+                return None
+            return e.modBaseAddr, e.szExePath
+        finally:
+            _k32.CloseHandle(snap)
 
     def find_pid(name=GAME_EXE):
         snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -178,6 +266,7 @@ class LiveReader:
         self.error = None if WINDOWS else 'live reading needs Windows'
         self.maps = {}          # table index -> (key, {hash: entry index})
         self.next_try = 0.0     # don't look for the process more than once a second while it's not there
+        self.clock = None       # (pid, address of the world clock or None when this build has none)
 
     # ---- process
     def _attach(self):
@@ -349,6 +438,42 @@ class LiveReader:
                 return None
             raw = p.read(text, cap).split(b'\0', 1)[0]
             return raw.decode('ascii') if raw and all(0x20 < c < 0x7f for c in raw) else None
+        return self._call(read)
+
+    # ---- TotK Recomp
+    def _find_clock(self, p):
+        """The address of the world clock in this process, or None (looked up once per process)."""
+        if self.clock and self.clock[0] == p.pid:
+            return self.clock[1]
+        addr = None
+        mod = main_module(p.pid)
+        if mod:
+            base, path = mod
+            try:
+                with open(path, 'rb') as f:
+                    found = pe_static(f, WORLD_CLOCK)
+            except OSError:
+                found = None
+            if found:
+                rva, fh, buildid = found
+                pe = struct.unpack('<I', p.read(base + 0x3c, 4))[0]
+                same = p.read(base + pe + 4, 20) == fh   # the file is the image running, not a newer copy
+                if same and buildid:
+                    same = p.read(base + buildid[0], len(buildid[1])) == buildid[1]
+                if same:
+                    addr = base + rva
+        self.clock = (p.pid, addr)
+        return addr
+
+    def world_us(self):
+        """TotK Recomp's world clock: microseconds of game time since the first save loaded, or None before that or
+        when this build has no clock the reader can find."""
+        def read(p):
+            addr = self._find_clock(p)
+            if addr is None:
+                return None
+            w = struct.unpack('<q', p.read(addr, 8))[0]
+            return w if 0 <= w < MAX_WORLD_US else None
         return self._call(read)
 
     def status(self):

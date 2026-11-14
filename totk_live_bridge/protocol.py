@@ -44,7 +44,8 @@ COMMANDS = [
     ('help', '', 'the commands, and the bridge: its version, protocol and whether it can read this game build'),
     ('pos', '', "Link's world position x, y, z, yaw and heading, as the official pos (in a shrine: the shrine's "
                 "own coordinates; x-scene tells)"),
-    ('state', '', 'game (version), in_world, uptime_s: the fields of the official state the bridge can know'),
+    ('state', '', 'game (version), uptime_s, world_s (game time since the save loaded, left out before), in_world: '
+                  'the fields of the official state the bridge can know'),
     ('x-scene', '', "scene: 'MainField' (the open world) or the shrine Link is in ('Dungeon062'); shrine: true in one"),
     ('x-flags', '', 'the GameData flags and the set GUIDs, as in progress.sav: flags = base64 of <II (hash, value) '
                     'pairs, guids = base64 of <Q'),
@@ -112,12 +113,19 @@ class Bridge:
         st = self.reader.status()
         if not st['available']:
             raise LiveError(st['error'])
+        out = {'game': GAME_VERSION, 'uptime_s': round(time.monotonic() - self.started, 1)}
+        try:
+            w = self.reader.world_us()
+        except LiveError:
+            w = None
+        if w is not None:   # as the official state: left out before the first save has loaded
+            out['world_s'] = round(w / 1e6, 1)
         try:
             self._pose()
-            in_world = True
+            out['in_world'] = True
         except LiveError:
-            in_world = False
-        return {'game': GAME_VERSION, 'uptime_s': round(time.monotonic() - self.started, 1), 'in_world': in_world}
+            out['in_world'] = False
+        return out
 
     # ---- extensions
     def cmd_x_scene(self):
