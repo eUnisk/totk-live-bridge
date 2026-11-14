@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "totk-live-bridge"
+dynamic = ["version"]
+description = "Live data from Tears of the Kingdom in TotK Recomp for companion apps, in the protocol of its control socket"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = []
+classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3"]
+
+[project.urls]
+Homepage = "https://github.com/eUnisk/totk-live-bridge"
+
+[project.scripts]
+totk-live-bridge = "totk_live_bridge.__main__:main"
+
+[tool.setuptools]
+packages = ["totk_live_bridge"]
+
+[tool.setuptools.dynamic]
+version = {attr = "totk_live_bridge.__version__"}
