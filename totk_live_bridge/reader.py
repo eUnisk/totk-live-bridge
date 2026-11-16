@@ -9,7 +9,7 @@ written to it. Windows only; elsewhere (and when the game isn't running, or is a
 found for) `LiveReader.status()['available']` is False and the app keeps reading the saves.
 
 TotK Recomp runs the game with guest address == host address and loads `main` at 0x7000000000, so the
-addresses below are the same every start. They were found for TotK 1.4.3 with TotK Recomp 0.4.0 and are
+addresses below are the same every start. They were found for TotK 1.4.3 with TotK Recomp 0.4.0 (unchanged in 0.4.1) and are
 checked against the vtables of the GameData tables before anything is read.
 
 GameData (the flags the game writes to progress.sav):
@@ -38,7 +38,7 @@ The world clock (state's world_s) is TotK Recomp's own, not the game's: `world_u
 first save has loaded) in totk.exe's .data, the sum of the frame steps since the first present that found Link away
 from the origin. A later load (fast travel, another save, the title screen) doesn't restart it; the official socket
 answers it as world_s. totk.exe is an ordinary relocated image, so its address follows the recomp build: the reader
-finds it by name in the COFF symbol table of the totk.exe file the game runs from (TotK Recomp 0.4.0 ships one),
+finds it by name in the COFF symbol table of the totk.exe file the game runs from (TotK Recomp 0.4.0 and 0.4.1 ship one),
 after checking that the file's header and build id match the image in memory. A build without the symbol (or a
 changed file) only leaves world_s out.
 """
@@ -94,8 +94,9 @@ WORLD_SCENE = 'MainField'   # what scene() calls the open world (sky, surface an
 # a newer TotK Recomp that loads the game the same way keeps them. The vtable check decides either way.
 WORLD_CLOCK = b'world_us'    # TotK Recomp's world clock, a static s64 in totk.exe's .data (see above)
 MAX_WORLD_US = 10 * 365 * 86400 * 10**6     # anything above is not a clock
-GAME_VERSION, RECOMP_VERSION = '1.4.3', '0.4.0'   # the game they were found for, and the recomp it was tested in
-SUPPORTED = f'TotK {GAME_VERSION} (tested in TotK Recomp {RECOMP_VERSION})'
+GAME_VERSION = '1.4.3'                  # the game they were found for
+RECOMP_TESTED = ('0.4.0', '0.4.1')      # the TotK Recomp releases the bridge was tested in
+SUPPORTED = f'TotK {GAME_VERSION} (tested in TotK Recomp {" and ".join(RECOMP_TESTED)})'
 
 
 class LiveError(Exception):
